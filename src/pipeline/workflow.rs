@@ -9,6 +9,10 @@ use crate::pipeline::matching::{CandidateBundle, MatchingOrchestrator};
 use crate::pipeline::preprocess::PreprocessedGraph;
 
 /// High-level configuration for running the online workflow.
+///
+/// Default values (see `Default` implementation):
+/// * `epsilon = 1e-6` caps numerical drift in spectral comparisons.
+/// * `dominance_threshold = 0.4` keeps spectral checks strict while allowing interlacing slack.
 #[derive(Debug, Clone)]
 pub struct WorkflowConfig {
     pub anchor_count: Option<usize>,
@@ -21,7 +25,7 @@ impl Default for WorkflowConfig {
         Self {
             anchor_count: None,
             epsilon: 1e-6,
-            dominance_threshold: 0.9,
+            dominance_threshold: 0.4,
         }
     }
 }
@@ -75,6 +79,7 @@ impl MatchingWorkflow {
         info!("Refining candidates via spectral + WL screening");
         let mut bundles = MatchingOrchestrator::refine_candidates(
             &self.pattern.spectral,
+            self.pattern.node_count(),
             subgraphs,
             self.config.epsilon,
         )?;

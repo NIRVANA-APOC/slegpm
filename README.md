@@ -92,6 +92,21 @@ Exports are centralised in `src/lib.rs` and `src/pipeline/mod.rs` to ease reuse 
 
 ## Mapping to the Original Algorithm
 
+## Differences From the Technical Report
+
+* **Normalized Laplacian** - the implementation uses the symmetric normalized Laplacian (\(D^{-1/2}LD^{-1/2}\)) while the report's baseline discusses the unnormalized variant. This improves numerical stability for heterogeneous-degree graphs.
+* **Spectral profile augmentation** - in addition to the leading eigenvalues, `SpectralProfile` tracks the L2 norm and trace, enabling richer dominance checks.
+* **WL histogram pruning** - candidates are compared via WL color histograms rather than the linear sum pooling described in the report, increasing discrimination on symmetric motifs.
+* **Dominance reporting** - dominance checks emit weighted audit reports (ratio of satisfied conditions) to aid debugging; the report only states binary decisions.
+* **Sampling & serialization utilities** - JSON exporters and the `sampling::pattern_sampler` module support self-validation experiments beyond the original pipeline description.
+
+## Configuration Defaults
+
+* `WorkflowConfig::default()` sets `epsilon = 1e-6` and `dominance_threshold = 0.9`.
+* CLI defaults (see `main.rs`) load pattern/target graphs from `datasets/yeast` and override anchors with `3`.
+* Spectral equivalence tolerances combine the configured `epsilon` with fixed absolute floors (currently `1e-2`) to absorb floating-point noise.
+
+
 | Report step | Code implementation | Notes |
 | --- | --- | --- |
 | Graph ingestion & normalization | `graph::construction`, `pipeline::preprocess` | Preserves rich attributes; ensures Laplacian correctness |
@@ -129,3 +144,4 @@ Run this test after tuning thresholds or heuristics to ensure the pipeline still
 3. Experiment with advanced candidate enumeration or incremental refinement strategies for very large targets.
 
 Consult the "Mapping to the Original Algorithm" table above to trace each report requirement back to its concrete implementation.
+

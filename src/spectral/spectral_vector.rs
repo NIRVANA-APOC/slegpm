@@ -132,3 +132,63 @@ fn recommended_k(n: usize) -> usize {
     let value = base.log2().ceil() as usize;
     value.max(1).min(n)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::model::{EdgeAttributes, GraphInstance, LabeledGraph, NodeAttributes};
+    use crate::spectral::NormalizedLaplacianBuilder;
+    use indexmap::IndexMap;
+
+    fn triangle_graph() -> GraphInstance {
+        let mut graph = LabeledGraph::with_capacity(3, 6);
+        let mut node_lookup = IndexMap::new();
+        let mut reverse_lookup = IndexMap::new();
+        for id in ["a", "b", "c"] {
+            let attrs = NodeAttributes {
+                label: Some(id.to_string()),
+                weight: None,
+                extra: IndexMap::new(),
+            };
+            let idx = graph.add_node(attrs);
+            node_lookup.insert(id.to_string(), idx);
+            reverse_lookup.insert(idx, id.to_string());
+        }
+        let mut add_edge = |u: &str, v: &str| {
+            let edge = EdgeAttributes {
+                weight: Some(1.0),
+                extra: IndexMap::new(),
+            };
+            let u_idx = node_lookup[u];
+            let v_idx = node_lookup[v];
+            graph.add_edge(u_idx, v_idx, edge.clone());
+            graph.add_edge(v_idx, u_idx, edge);
+        };
+        add_edge("a", "b");
+        add_edge("b", "c");
+        add_edge("c", "a");
+        GraphInstance {
+            graph,
+            node_lookup,
+            reverse_lookup,
+            graph_attributes: IndexMap::new(),
+            directed: false,
+        }
+    }
+
+    #[test]
+    fn spectral_profile_orders_eigenvalues() {
+        let graph = triangle_graph();
+        let lap = NormalizedLaplacianBuilder::build(&graph).expect("laplacian");
+        let profile = SpectralVectorExtractor::compute_profile(&lap).expect("profile");
+        let eigenvalues: Vec<f64> = profile.eigenvalues.iter().copied().collect();
+        assert!(!eigenvalues.is_empty());
+        for pair in eigenvalues.windows(2) {
+            assert!(pair[0] <= pair[1] + 1e-9);
+        }
+        assert!(
+            (eigenvalues[0]).abs() < 1e-9,
+            "first eigenvalue should be zero for connected graph"
+        );
+    }
+}

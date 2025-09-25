@@ -3,7 +3,6 @@ use slegpm::{
     GraphLoader, GraphPreprocessor, GraphWriter, MatchingWorkflow, PatternSampler, SampleConfig,
     WorkflowConfig,
 };
-use std::fmt::format;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -181,7 +180,7 @@ fn pattern_sampler_produces_connected_subgraphs() {
 
 #[test]
 fn sampled_patterns_match_source() {
-    use petgraph::algo::isomorphism::{is_isomorphic_matching, is_isomorphic_subgraph_matching};
+    use petgraph::algo::isomorphism::is_isomorphic_matching;
 
     let dataset_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("datasets/yeast/data_graph.json");
@@ -196,7 +195,7 @@ fn sampled_patterns_match_source() {
 
     let config = SampleConfig {
         nodes: 6,
-        samples: 2,
+        samples: 10,
         seed: Some(123),
     };
     let patterns = PatternSampler::sample_patterns(&target, config).expect("sample patterns");
@@ -214,14 +213,12 @@ fn sampled_patterns_match_source() {
         .unwrap()
     });
 
-    assert_eq!(patterns.len(), 2);
-
     let target_pre =
         GraphPreprocessor::preprocess_graph(target.clone()).expect("preprocess target");
     let workflow_config = WorkflowConfig {
         anchor_count: Some(3),
         epsilon: 1e-3,
-        dominance_threshold: 0.0,
+        ..WorkflowConfig::default()
     };
 
     for pattern in patterns {

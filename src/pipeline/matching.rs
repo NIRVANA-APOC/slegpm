@@ -1,8 +1,11 @@
 use anyhow::Result;
 use indexmap::IndexSet;
 use log::{debug, trace};
-use petgraph::algo::isomorphism::{is_isomorphic_matching, is_isomorphic_subgraph_matching};
+use petgraph::algo::isomorphism::{
+    is_isomorphic_matching, is_isomorphic_subgraph_matching, subgraph_isomorphisms_iter,
+};
 use petgraph::prelude::NodeIndex;
+use petgraph::visit::NodeIndexable;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
@@ -22,9 +25,11 @@ const NEAR_PATTERN_RATIO: f64 = 1.5;
 const MAX_PRECISE_PER_CANDIDATE: usize = 32;
 const MAX_ANCHOR_SHRINK_ATTEMPTS: usize = 4;
 const COARSE_WL_DEFICIT_RATIO: f64 = 0.2;
-const VF2_DEFICIT_FALLBACK_RATIO: f64 = 0.25;
+const VF2_DEFICIT_FALLBACK_RATIO: f64 = 0.5;
 const SPECTRAL_DISTANCE_RATIO: f64 = 1.5;
 const SPECTRAL_EQUIVALENCE_ABS: f64 = 1e-2;
+const SPECTRAL_MIN_RATIO: f64 = 0.6;
+const MAX_INITIAL_CANDIDATE_FACTOR: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct CandidateBundle {
@@ -87,18 +92,27 @@ pub struct MatchingOrchestrator;
 impl MatchingOrchestrator {
     pub fn refine_candidates(
         pattern_profile: &SpectralProfile,
+        pattern_size: usize,
         subgraphs: Vec<GraphInstance>,
         epsilon: f64,
     ) -> Result<Vec<CandidateBundle>> {
         let results: Vec<Result<Option<CandidateBundle>>> = subgraphs
             .into_par_iter()
             .map(|candidate| -> Result<Option<CandidateBundle>> {
+                let candidate_size = candidate.graph.node_count();
+                if candidate_size < pattern_size {
+                    return Ok(None);
+                }
+                if candidate_size > pattern_size * MAX_INITIAL_CANDIDATE_FACTOR {
+                    return Ok(None);
+                }
+
                 let laplacian = NormalizedLaplacianBuilder::build(&candidate)?;
                 let spectral = SpectralVectorExtractor::compute_profile(&laplacian)?;
                 if !spectral_dominates(&spectral, pattern_profile, epsilon) {
                     return Ok(None);
                 }
-                let wl_signature = compute_wl_signature(&candidate, 0);
+                let wl_signature = compute_wl_signature(&candidate, 1);
                 Ok(Some(CandidateBundle {
                     graph: candidate,
                     spectral,
@@ -131,6 +145,7 @@ impl MatchingOrchestrator {
         let pattern_signature_coarse = compute_wl_signature(pattern, 0);
         let pattern_signature_precise = compute_wl_signature(pattern, WL_ITERATIONS);
         let pattern_size = pattern.graph.node_count();
+        let wl_deficit_threshold = compute_wl_deficit_threshold(pattern);
 
         let results: Vec<Result<(Vec<GraphInstance>, Vec<String>)>> = refined
             .into_par_iter()
@@ -172,12 +187,13 @@ impl MatchingOrchestrator {
                     notes.push("Coarse WL deficits: none".to_string());
                 } else {
                     notes.push(format!(
-                        "Coarse WL deficits: missing {} nodes across {} slots (ratio {:.3})",
+                        "Coarse WL deficits: missing {} nodes across {} slots (ratio {:.3}, threshold {:.3})",
                         missing_total,
                         deficit_slots,
-                        wl_ratio
+                        wl_ratio,
+                        wl_deficit_threshold
                     ));
-                    if wl_ratio > COARSE_WL_DEFICIT_RATIO && candidate_size > pattern_size {
+                    if wl_ratio > wl_deficit_threshold && candidate_size > pattern_size {
                         notes.push("Rejected: coarse WL deficit ratio too high".to_string());
                         return Ok((Vec::new(), notes));
                     }
@@ -234,12 +250,26 @@ impl MatchingOrchestrator {
                 let mut matches = Vec::new();
                 for candidate_graph in refined_precise {
                     if run_vf2(pattern, &candidate_graph, epsilon) {
-                        notes.push(format!(
-                            "VF2 success on candidate |V|={}, |E|={}",
-                            candidate_graph.graph.node_count(),
-                            candidate_graph.graph.edge_count()
-                        ));
-                        matches.push(candidate_graph);
+                        let mut result_graph = candidate_graph.clone();
+                        if result_graph.graph.node_count() > pattern.graph.node_count() {
+                            if let Some(extracted) = extract_isomorphic_subgraph(pattern, &result_graph, epsilon) {
+                                notes.push(format!("VF2 success on candidate |V|={}, |E|={} (trimmed to |V|={}, |E|={})",
+                                    result_graph.graph.node_count(),
+                                    result_graph.graph.edge_count(),
+                                    extracted.graph.node_count(),
+                                    extracted.graph.edge_count()));
+                                result_graph = extracted;
+                            } else {
+                                notes.push(format!("VF2 success on candidate |V|={}, |E|={} (untrimmed)",
+                                    result_graph.graph.node_count(),
+                                    result_graph.graph.edge_count()));
+                            }
+                        } else {
+                            notes.push(format!("VF2 success on candidate |V|={}, |E|={}",
+                                result_graph.graph.node_count(),
+                                result_graph.graph.edge_count()));
+                        }
+                        matches.push(result_graph);
                     } else {
                         notes.push(format!(
                             "VF2 rejection on candidate |V|={}, |E|={}",
@@ -252,7 +282,18 @@ impl MatchingOrchestrator {
                 if matches.is_empty() && wl_ratio <= VF2_DEFICIT_FALLBACK_RATIO {
                     if run_vf2(pattern, &graph, epsilon) {
                         notes.push("VF2 fallback on original candidate succeeded".to_string());
-                        matches.push(graph.clone());
+                        if graph.graph.node_count() > pattern.graph.node_count() {
+                            if let Some(extracted) = extract_isomorphic_subgraph(pattern, &graph, epsilon) {
+                                notes.push(format!("Fallback trimming produced |V|={}, |E|={}",
+                                    extracted.graph.node_count(),
+                                    extracted.graph.edge_count()));
+                                matches.push(extracted);
+                            } else {
+                                matches.push(graph.clone());
+                            }
+                        } else {
+                            matches.push(graph.clone());
+                        }
                     } else {
                         notes.push("VF2 fallback on original candidate failed".to_string());
                     }
@@ -313,27 +354,64 @@ fn spectral_dominates(
     pattern: &SpectralProfile,
     epsilon: f64,
 ) -> bool {
-    let pattern_vals: Vec<f64> = pattern.eigenvalues.iter().copied().collect();
-    let candidate_vals: Vec<f64> = candidate.eigenvalues.iter().copied().collect();
+    let pattern_vals = match pattern.eigenvalues.as_slice() {
+        Some(slice) => slice,
+        None => return true,
+    };
+    let candidate_vals = match candidate.eigenvalues.as_slice() {
+        Some(slice) => slice,
+        None => return true,
+    };
     if candidate_vals.len() < pattern_vals.len() {
         return false;
     }
 
-    for (idx, pattern_value) in pattern_vals.iter().copied().enumerate() {
-        if let Some(&candidate_value) = candidate_vals.get(idx) {
-            if candidate_value + epsilon < pattern_value {
-                trace!(
-                    "Spectral dominance violated at index {}: candidate {:.6} < pattern {:.6}",
-                    idx, candidate_value, pattern_value
-                );
-                return false;
-            }
-        } else {
+    if let Some(distance) = spectral_distance(candidate, pattern) {
+        let bound = SPECTRAL_DISTANCE_RATIO * (pattern_vals.len().max(1) as f64).sqrt();
+        if distance > bound {
+            trace!(
+                "Spectral distance {:.6} exceeds bound {:.6}",
+                distance, bound
+            );
             return false;
         }
     }
 
-    candidate.norm_l2 + epsilon >= pattern.norm_l2 && candidate.trace + epsilon >= pattern.trace
+    let norm_floor = pattern.norm_l2 * SPECTRAL_MIN_RATIO;
+    if candidate.norm_l2 + epsilon + SPECTRAL_EQUIVALENCE_ABS < norm_floor {
+        trace!(
+            "Spectral norm {:.6} below floor {:.6}",
+            candidate.norm_l2, norm_floor
+        );
+        return false;
+    }
+
+    let trace_floor = pattern.trace.abs() * SPECTRAL_MIN_RATIO;
+    if candidate.trace.abs() + epsilon + SPECTRAL_EQUIVALENCE_ABS < trace_floor {
+        trace!(
+            "Spectral trace {:.6} below floor {:.6}",
+            candidate.trace, trace_floor
+        );
+        return false;
+    }
+
+    true
+}
+
+fn compute_wl_deficit_threshold(pattern: &GraphInstance) -> f64 {
+    let pattern_size = pattern.graph.node_count().max(1);
+    let pattern_edges = pattern.graph.edge_count();
+    let density = if pattern_size > 1 {
+        pattern_edges as f64 / ((pattern_size * (pattern_size - 1)) as f64)
+    } else {
+        0.0
+    };
+    let log_term = (pattern_size as f64).max(3.0).ln();
+    let adaptive = 1.0 - (1.0 / log_term);
+    let density_relief = (1.0 - density).clamp(0.0, 1.0);
+    let threshold =
+        COARSE_WL_DEFICIT_RATIO + 0.25 * adaptive.clamp(0.0, 1.0) + 0.25 * density_relief;
+    threshold.clamp(0.05, 0.6)
 }
 
 fn spectral_distance(candidate: &SpectralProfile, pattern: &SpectralProfile) -> Option<f64> {
@@ -562,13 +640,15 @@ fn evaluate_precise_candidates(
                 if stats.sample_wl_mismatch.is_none() {
                     stats.sample_wl_mismatch = Some(format!(
                         "pattern {:?} | candidate {:?}",
-                        pattern_signature.histogram,
-                        candidate_signature.histogram
+                        pattern_signature.histogram, candidate_signature.histogram
                     ));
                 }
                 if stats.wl_mismatch <= 3 {
                     debug!("Pattern WL histogram: {:?}", pattern_signature.histogram);
-                    debug!("Candidate WL histogram: {:?}", candidate_signature.histogram);
+                    debug!(
+                        "Candidate WL histogram: {:?}",
+                        candidate_signature.histogram
+                    );
                 }
                 debug!(
                     "Precise WL mismatch for |V|={} candidate; rejecting",
@@ -583,9 +663,7 @@ fn evaluate_precise_candidates(
                 stats.wl_deficit += 1;
                 debug!(
                     "Larger candidate |V|={} missing {} nodes across {} WL slots; rejecting",
-                    candidate_size,
-                    missing_total,
-                    deficit_slots
+                    candidate_size, missing_total, deficit_slots
                 );
                 continue;
             }
@@ -609,7 +687,10 @@ fn evaluate_precise_candidates(
 
         if !spectral_ok {
             stats.spectral_fail += 1;
-            debug!("Spectral check failed for precise candidate |V|={}", candidate_size);
+            debug!(
+                "Spectral check failed for precise candidate |V|={}",
+                candidate_size
+            );
             continue;
         }
 
@@ -630,7 +711,11 @@ fn evaluate_precise_candidates(
     Ok((refined, stats))
 }
 
-fn spectral_equivalent(candidate: &SpectralProfile, pattern: &SpectralProfile, epsilon: f64) -> bool {
+fn spectral_equivalent(
+    candidate: &SpectralProfile,
+    pattern: &SpectralProfile,
+    epsilon: f64,
+) -> bool {
     let len = pattern.eigenvalues.len();
     if candidate.eigenvalues.len() < len {
         return false;
@@ -653,6 +738,37 @@ fn spectral_equivalent(candidate: &SpectralProfile, pattern: &SpectralProfile, e
     }
 
     true
+}
+
+fn extract_isomorphic_subgraph(
+    pattern: &GraphInstance,
+    candidate: &GraphInstance,
+    epsilon: f64,
+) -> Option<GraphInstance> {
+    let pattern_ref = &pattern.graph;
+    let candidate_ref = &candidate.graph;
+    let mut node_match = |a: &NodeAttributes, b: &NodeAttributes| node_compatible(a, b, epsilon);
+    let mut edge_match = |a: &EdgeAttributes, b: &EdgeAttributes| edge_compatible(a, b, epsilon);
+    let mut iso_iter = subgraph_isomorphisms_iter(
+        &pattern_ref,
+        &candidate_ref,
+        &mut node_match,
+        &mut edge_match,
+    )?;
+
+    if let Some(mapping) = iso_iter.next() {
+        let mut node_ids: IndexSet<String> = IndexSet::new();
+        for target_index in mapping {
+            let node_idx = candidate_ref.from_index(target_index);
+            if let Some(id) = candidate.reverse_lookup.get(&node_idx) {
+                node_ids.insert(id.clone());
+            }
+        }
+        if node_ids.len() == pattern.graph.node_count() {
+            return GraphLoader::induced_subgraph(candidate, &node_ids).ok();
+        }
+    }
+    None
 }
 
 fn run_vf2(pattern: &GraphInstance, candidate: &GraphInstance, epsilon: f64) -> bool {

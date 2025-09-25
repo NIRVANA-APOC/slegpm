@@ -49,6 +49,7 @@ fn main() -> Result<()> {
 
     let config = WorkflowConfig {
         anchor_count: Some(anchor_override),
+        epsilon: 1e-3,
         ..WorkflowConfig::default()
     };
 
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
     let summary = workflow.execute()?;
 
     for (idx, entry) in summary.audit_log.iter().enumerate() {
+        println!("\n--------------------------------------------------------------------------");
         println!("Candidate {}:\n{}", idx + 1, entry);
     }
 

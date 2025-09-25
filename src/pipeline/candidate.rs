@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use anyhow::{Result, anyhow};
 use indexmap::IndexSet;
 use log::debug;
+use petgraph::prelude::NodeIndex;
 use petgraph::visit::IntoNodeReferences;
 use rayon::prelude::*;
 
@@ -130,7 +131,21 @@ impl SubgraphExtractor {
         if pattern_size == 0 {
             return Ok(Vec::new());
         }
-        let radius = ((pattern_size as f64).log2().ceil() as usize).max(1);
+        let base_radius = ((pattern_size as f64).log2().ceil() as usize).max(1);
+        let mut radius_candidates = vec![base_radius];
+        if base_radius + 1 <= pattern_size {
+            radius_candidates.push(base_radius + 1);
+        }
+        if pattern_size > base_radius {
+            radius_candidates.push(pattern_size);
+        }
+        radius_candidates.sort_unstable();
+        radius_candidates.dedup();
+
+        let max_nodes = pattern_size
+            .saturating_mul(2)
+            .max(pattern_size)
+            .min(target.graph.node_count().max(pattern_size));
 
         let results: Vec<Result<Option<GraphInstance>>> = candidates
             .par_iter()
@@ -139,28 +154,21 @@ impl SubgraphExtractor {
                     anyhow!("Candidate '{}' not found in target graph", candidate_id)
                 })?;
 
-                let mut visited = IndexSet::new();
-                let mut queue = VecDeque::new();
-                queue.push_back((*start_idx, 0usize));
-                visited.insert(*start_idx);
-
-                while let Some((node_idx, depth)) = queue.pop_front() {
-                    if depth >= radius {
-                        continue;
-                    }
-                    for neighbor in target.graph.neighbors(node_idx) {
-                        if visited.insert(neighbor) {
-                            queue.push_back((neighbor, depth + 1));
-                        }
-                    }
-                    if visited.len() >= pattern_size * 2 {
+                let mut collected = IndexSet::new();
+                for radius in &radius_candidates {
+                    collected = bfs_collect_limited(target, *start_idx, max_nodes, Some(*radius));
+                    if collected.len() >= pattern_size {
                         break;
                     }
                 }
 
+                if collected.len() < pattern_size {
+                    return Ok(None);
+                }
+
                 let mut node_ids = IndexSet::new();
-                for idx in visited.iter() {
-                    if let Some(id) = target.reverse_lookup.get(idx) {
+                for idx in collected.into_iter().take(max_nodes) {
+                    if let Some(id) = target.reverse_lookup.get(&idx) {
                         node_ids.insert(id.clone());
                     }
                 }
@@ -199,4 +207,38 @@ fn weight_matches(left: Option<f64>, right: Option<f64>, epsilon: f64) -> bool {
         (Some(_), None) => false,
         _ => true,
     }
+}
+
+fn bfs_collect_limited(
+    graph: &GraphInstance,
+    start: NodeIndex,
+    max_nodes: usize,
+    max_radius: Option<usize>,
+) -> IndexSet<NodeIndex> {
+    let mut visited = IndexSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(start);
+    queue.push_back((start, 0usize));
+
+    while let Some((node, depth)) = queue.pop_front() {
+        if let Some(limit) = max_radius {
+            if depth >= limit {
+                continue;
+            }
+        }
+        if visited.len() >= max_nodes {
+            continue;
+        }
+        let next_depth = depth + 1;
+        for neighbor in graph.graph.neighbors(node) {
+            if visited.len() >= max_nodes {
+                break;
+            }
+            if visited.insert(neighbor) {
+                queue.push_back((neighbor, next_depth));
+            }
+        }
+    }
+
+    visited
 }

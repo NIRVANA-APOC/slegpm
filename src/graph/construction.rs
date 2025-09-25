@@ -158,3 +158,49 @@ fn value_to_string(value: serde_json::Value) -> Option<String> {
         other => Some(other.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_graph_json() -> String {
+        r#"{
+            "directed": false,
+            "nodes": [
+                {"id": "u", "attributes": {"label": "U"}},
+                {"id": "v", "attributes": {"label": "V"}},
+                {"id": "w", "attributes": {"label": "W"}}
+            ],
+            "edges": [
+                {"source": "u", "target": "v", "attributes": {"weight": 1.0}},
+                {"source": "v", "target": "w", "attributes": {}}
+            ]
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn load_json_graph_counts_match() {
+        let graph = GraphLoader::from_json_str(&sample_graph_json()).expect("load graph");
+        assert_eq!(graph.graph.node_count(), 3);
+        assert_eq!(
+            graph.graph.edge_count(),
+            4,
+            "undirected edges should be duplicated"
+        );
+        assert!(graph.node_lookup.contains_key("u"));
+        assert!(graph.reverse_lookup.values().any(|id| id == "w"));
+    }
+
+    #[test]
+    fn induced_subgraph_preserves_structure() {
+        let graph = GraphLoader::from_json_str(&sample_graph_json()).expect("load graph");
+        let mut nodes = IndexSet::new();
+        nodes.insert("u".to_string());
+        nodes.insert("v".to_string());
+        let subgraph = GraphLoader::induced_subgraph(&graph, &nodes).expect("subgraph");
+        assert_eq!(subgraph.graph.node_count(), 2);
+        assert_eq!(subgraph.graph.edge_count(), 2);
+        assert!(subgraph.node_lookup.contains_key("u"));
+    }
+}
