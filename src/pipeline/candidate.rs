@@ -1,129 +1,112 @@
-use std::cmp::Ordering;
 use std::collections::VecDeque;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
-use log::debug;
 use petgraph::prelude::NodeIndex;
-use petgraph::visit::IntoNodeReferences;
 use rayon::prelude::*;
 
-use crate::graph::construction::GraphLoader;
-use crate::graph::model::{GraphId, GraphInstance};
+use crate::graph::{GraphId, GraphInstance, GraphLoader};
 
-/// Select anchor nodes within the pattern graph using degree and attribute heuristics.
 pub struct AnchorSelector;
 
 impl AnchorSelector {
-    pub fn select_anchors(pattern: &GraphInstance, k: Option<usize>) -> IndexSet<GraphId> {
-        let node_count = pattern.graph.node_count();
-        if node_count == 0 {
-            return IndexSet::new();
+    pub fn select(pattern: &GraphInstance, limit: Option<usize>) -> Vec<GraphId> {
+        if pattern.node_count() == 0 {
+            return Vec::new();
         }
-        let target_k = k.unwrap_or_else(|| node_count.min(3).max(1));
-
-        let mut ranked: Vec<(f64, GraphId)> = pattern
+        let count = limit.unwrap_or_else(|| pattern.node_count().min(3));
+        let mut ranked: Vec<(usize, GraphId)> = pattern
             .graph
-            .node_references()
-            .filter_map(|(idx, attrs)| {
+            .node_indices()
+            .filter_map(|idx| {
+                let degree = pattern.graph.neighbors(idx).count();
+                let attrs = pattern.graph.node_weight(idx)?;
+                let label_bonus = attrs.label.as_ref().map(|_| 1).unwrap_or_default();
+                let weight_bonus = attrs.weight.map(|w| (w * 10.0) as i64).unwrap_or_default();
+                let score = degree * 10 + label_bonus + weight_bonus as usize;
                 let id = pattern.reverse_lookup.get(&idx)?.clone();
-                let degree = pattern.graph.neighbors(idx).count() as f64;
-                let label_bonus = if attrs.label.is_some() { 0.1 } else { 0.0 };
-                let weight_bonus = attrs.weight.unwrap_or(0.0);
-                Some((degree + label_bonus + weight_bonus, id))
+                Some((score, id))
             })
             .collect();
-
-        ranked.sort_by(|(score_a, _), (score_b, _)| {
-            score_b.partial_cmp(score_a).unwrap_or(Ordering::Equal)
-        });
-
+        ranked.sort_by(|a, b| b.0.cmp(&a.0));
         ranked
             .into_iter()
-            .take(target_k.min(node_count))
+            .take(count.max(1))
             .map(|(_, id)| id)
             .collect()
     }
 }
 
-#[derive(Clone)]
-struct AnchorDescriptor {
-    label: Option<String>,
-    weight: Option<f64>,
-    degree: usize,
-}
-
-/// Generate candidate nodes in the target graph for each anchor.
 pub struct CandidateGenerator;
 
 impl CandidateGenerator {
     pub fn filter_candidates(
         pattern: &GraphInstance,
         target: &GraphInstance,
-        anchors: &IndexSet<GraphId>,
+        anchors: &[GraphId],
         epsilon: f64,
     ) -> Result<IndexSet<GraphId>> {
-        let mut descriptors = Vec::new();
-        for anchor_id in anchors {
-            let anchor_idx = pattern
-                .node_lookup
-                .get(anchor_id)
-                .ok_or_else(|| anyhow!("Anchor '{}' not present in pattern graph", anchor_id))?;
-            let anchor_attrs = pattern
-                .graph
-                .node_weight(*anchor_idx)
-                .ok_or_else(|| anyhow!("Missing node weight for anchor '{}'", anchor_id))?;
-            let descriptor = AnchorDescriptor {
-                label: anchor_attrs.label.clone(),
-                weight: anchor_attrs.weight,
-                degree: pattern.graph.neighbors(*anchor_idx).count(),
-            };
-            descriptors.push(descriptor);
+        if anchors.is_empty() {
+            return Ok(IndexSet::new());
         }
 
-        let candidate_lists: Vec<Vec<GraphId>> = descriptors
+        let descriptors: Vec<_> = anchors
+            .iter()
+            .map(|anchor_id| -> Result<_> {
+                let index = pattern
+                    .node_lookup
+                    .get(anchor_id)
+                    .ok_or_else(|| anyhow!("Unknown anchor '{anchor_id}' in pattern"))?;
+                let attrs = pattern
+                    .graph
+                    .node_weight(*index)
+                    .ok_or_else(|| anyhow!("Missing attributes for anchor '{anchor_id}'"))?;
+                Ok((
+                    attrs.label.clone(),
+                    attrs.weight,
+                    pattern.graph.neighbors(*index).count(),
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        let candidate_sets: Vec<_> = descriptors
             .par_iter()
-            .map(|descriptor| {
+            .map(|(label, weight, degree)| {
                 target
                     .graph
-                    .node_references()
-                    .filter_map(|(target_idx, target_attrs)| {
-                        if !label_matches(
-                            descriptor.label.as_deref(),
-                            target_attrs.label.as_deref(),
-                        ) {
+                    .node_indices()
+                    .filter_map(|idx| {
+                        let attrs = target.graph.node_weight(idx)?;
+                        if !label_matches(label.as_ref(), attrs.label.as_ref()) {
                             return None;
                         }
-                        if !weight_matches(descriptor.weight, target_attrs.weight, epsilon) {
+                        if !weight_matches(*weight, attrs.weight, epsilon) {
                             return None;
                         }
-                        let target_degree = target.graph.neighbors(target_idx).count();
-                        if target_degree < descriptor.degree {
+                        if target.graph.neighbors(idx).count() < *degree {
                             return None;
                         }
-                        target.reverse_lookup.get(&target_idx).cloned()
+                        target.reverse_lookup.get(&idx).cloned()
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .collect();
 
-        let mut candidates = IndexSet::new();
-        for list in candidate_lists {
-            for id in list {
-                candidates.insert(id);
+        let mut merged = IndexSet::new();
+        for set in candidate_sets {
+            for id in set {
+                merged.insert(id);
             }
         }
 
-        debug!("Candidates after filtering: {}", candidates.len());
-        Ok(candidates)
+        Ok(merged)
     }
 }
 
-/// Produce induced subgraphs around candidate nodes with dynamic radii.
 pub struct SubgraphExtractor;
 
 impl SubgraphExtractor {
-    pub fn extract_subgraphs(
+    pub fn extract(
         target: &GraphInstance,
         candidates: &IndexSet<GraphId>,
         pattern_size: usize,
@@ -131,89 +114,44 @@ impl SubgraphExtractor {
         if pattern_size == 0 {
             return Ok(Vec::new());
         }
-        let base_radius = ((pattern_size as f64).log2().ceil() as usize).max(1);
-        let mut radius_candidates = vec![base_radius];
-        if base_radius + 1 <= pattern_size {
-            radius_candidates.push(base_radius + 1);
-        }
-        if pattern_size > base_radius {
-            radius_candidates.push(pattern_size);
-        }
-        radius_candidates.sort_unstable();
-        radius_candidates.dedup();
 
-        let max_nodes = pattern_size
-            .saturating_mul(2)
-            .max(pattern_size)
-            .min(target.graph.node_count().max(pattern_size));
+        let radius = (pattern_size as f64).log2().ceil() as usize;
+        let max_nodes = pattern_size.saturating_mul(2).max(pattern_size);
+        let candidate_ids: Vec<GraphId> = candidates.iter().cloned().collect();
 
-        let results: Vec<Result<Option<GraphInstance>>> = candidates
+        let subgraphs: Vec<_> = candidate_ids
             .par_iter()
-            .map(|candidate_id| -> Result<Option<GraphInstance>> {
-                let start_idx = target.node_lookup.get(candidate_id).ok_or_else(|| {
-                    anyhow!("Candidate '{}' not found in target graph", candidate_id)
-                })?;
-
-                let mut collected = IndexSet::new();
-                for radius in &radius_candidates {
-                    collected = bfs_collect_limited(target, *start_idx, max_nodes, Some(*radius));
-                    if collected.len() >= pattern_size {
-                        break;
-                    }
-                }
-
+            .filter_map(|id| {
+                let idx = target.node_lookup.get(id)?;
+                let collected = bfs_collect(target, *idx, max_nodes, radius.max(1));
                 if collected.len() < pattern_size {
-                    return Ok(None);
+                    return None;
                 }
-
-                let mut node_ids = IndexSet::new();
-                for idx in collected.into_iter().take(max_nodes) {
-                    if let Some(id) = target.reverse_lookup.get(&idx) {
-                        node_ids.insert(id.clone());
-                    }
+                let ids: Vec<GraphId> = collected
+                    .into_iter()
+                    .filter_map(|node| target.reverse_lookup.get(&node).cloned())
+                    .take(pattern_size)
+                    .collect();
+                if ids.len() < pattern_size {
+                    return None;
                 }
-
-                if node_ids.len() >= pattern_size {
-                    let subgraph = GraphLoader::induced_subgraph(target, &node_ids)?;
-                    Ok(Some(subgraph))
-                } else {
-                    Ok(None)
-                }
+                Some(GraphLoader::induced_subgraph(target, &ids))
             })
             .collect();
 
-        let mut subgraphs = Vec::new();
-        for res in results {
-            if let Some(graph) = res? {
-                subgraphs.push(graph);
-            }
+        let mut results = Vec::new();
+        for graph in subgraphs {
+            results.push(graph?);
         }
-        debug!("Subgraphs extracted: {}", subgraphs.len());
-        Ok(subgraphs)
+        Ok(results)
     }
 }
 
-fn label_matches(left: Option<&str>, right: Option<&str>) -> bool {
-    match (left, right) {
-        (Some(l), Some(r)) => l == r,
-        (Some(_), None) => false,
-        _ => true,
-    }
-}
-
-fn weight_matches(left: Option<f64>, right: Option<f64>, epsilon: f64) -> bool {
-    match (left, right) {
-        (Some(l), Some(r)) => (l - r).abs() <= epsilon,
-        (Some(_), None) => false,
-        _ => true,
-    }
-}
-
-fn bfs_collect_limited(
+fn bfs_collect(
     graph: &GraphInstance,
     start: NodeIndex,
     max_nodes: usize,
-    max_radius: Option<usize>,
+    radius: usize,
 ) -> IndexSet<NodeIndex> {
     let mut visited = IndexSet::new();
     let mut queue = VecDeque::new();
@@ -221,24 +159,37 @@ fn bfs_collect_limited(
     queue.push_back((start, 0usize));
 
     while let Some((node, depth)) = queue.pop_front() {
-        if let Some(limit) = max_radius {
-            if depth >= limit {
-                continue;
-            }
-        }
         if visited.len() >= max_nodes {
+            break;
+        }
+        if depth >= radius {
             continue;
         }
-        let next_depth = depth + 1;
         for neighbor in graph.graph.neighbors(node) {
-            if visited.len() >= max_nodes {
-                break;
-            }
             if visited.insert(neighbor) {
-                queue.push_back((neighbor, next_depth));
+                queue.push_back((neighbor, depth + 1));
+                if visited.len() >= max_nodes {
+                    break;
+                }
             }
         }
     }
 
     visited
+}
+
+fn label_matches(left: Option<&String>, right: Option<&String>) -> bool {
+    match (left, right) {
+        (Some(lhs), Some(rhs)) => lhs == rhs,
+        (Some(_), None) => false,
+        _ => true,
+    }
+}
+
+fn weight_matches(left: Option<f64>, right: Option<f64>, epsilon: f64) -> bool {
+    match (left, right) {
+        (Some(lhs), Some(rhs)) => (lhs - rhs).abs() <= epsilon,
+        (Some(_), None) => false,
+        _ => true,
+    }
 }
